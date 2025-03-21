@@ -1,0 +1,45 @@
+version: "3.8"
+
+services:
+  manager:
+    build: ./manager
+    container_name: manager
+    ports:
+      - "8080:8080"
+    environment:
+      - WORKER1_ADDRESS=http://worker1:8081 
+      - WORKER2_ADDRESS=http://worker2:8082 
+      - WORKER3_ADDRESS=http://worker3:8083
+    networks:
+      - mynetwork
+
+  worker1:
+    build: ./worker
+    container_name: worker1
+    environment:
+      - MANAGER_ADDRESS=http://manager:8080
+      - PORT=8081 
+    networks:
+      - mynetwork
+
+  worker2:
+    build: ./worker
+    container_name: worker2
+    environment:
+      - MANAGER_ADDRESS=http://manager:8080
+      - PORT=8082 
+    networks:
+      - mynetwork
+
+  worker3:
+    build: ./worker
+    container_name: worker3
+    environment:
+      - MANAGER_ADDRESS=http://manager:8080
+      - PORT=8083 
+    networks:
+      - mynetwork
+
+networks:
+  mynetwork:
+      driver: bridge
