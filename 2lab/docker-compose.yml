@@ -1,0 +1,104 @@
+version: "3.8"
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    networks:
+      - mynetwork
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mongo-primary:
+    image: mongo
+    command: ["mongod", "--replSet", "rs0"]
+    ports:
+      - "27017:27017"
+    networks:
+      - mynetwork
+
+  mongo-secondary1:
+    image: mongo
+    command: ["mongod", "--replSet", "rs0"]
+    ports:
+      - "27018:27017"
+    networks:
+      - mynetwork
+
+  mongo-secondary2:
+    image: mongo
+    command: ["mongod", "--replSet", "rs0"]
+    ports:
+      - "27019:27017"
+    networks:
+      - mynetwork
+
+  mongo-init-replica:
+    image: mongo:latest
+    container_name: mongo-init-replica
+    depends_on:
+      - mongo-primary
+      - mongo-secondary1
+      - mongo-secondary2
+    command: >
+      bash -c "
+        echo 'Waiting for MongoDB nodes...' &&
+        sleep 10 &&
+        echo 'Checking replica set status...' &&
+        mongosh --host mongo-primary:27017 --quiet --eval \"
+          try {
+            rs_status = rs.status();
+            print('Replica set already initialized. Status:');
+            printjson(rs_status.ok);
+          } catch (e) {
+            print('Replica set not initialized, attempting initiation...');
+            rs.initiate({ _id: 'rs0', members: [ { _id: 0, host: 'mongo-primary:27017' }, { _id: 1, host: 'mongo-secondary1:27017' }, { _id: 2, host: 'mongo-secondary2:27017' } ]});
+            print('Replica set initiation command sent.');
+          }
+        \"
+      "
+    networks:
+      - mynetwork
+
+  manager:
+    build:
+      context: ./manager
+      dockerfile: Dockerfile
+    container_name: manager
+    ports:
+      - "8080:8080"
+    environment:
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+    depends_on:
+      rabbitmq:
+          condition: service_healthy
+      mongo-init-replica:
+          condition: service_completed_successfully
+    networks:
+      - mynetwork
+
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    environment:
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+    deploy:
+      replicas: 3
+    depends_on:
+      rabbitmq:
+          condition: service_healthy
+    networks:
+      - mynetwork
+
+networks:
+  mynetwork:
+      driver: bridge
