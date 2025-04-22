@@ -1,7 +1,9 @@
 package publisher
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/streadway/amqp"
@@ -23,6 +25,7 @@ const (
 type Publisher struct {
 	rabbitConn *amqp.Connection
 	rabbitChan *amqp.Channel
+	rabbitURL  string
 }
 
 func NewPublisher(rabbitURL string) (*Publisher, error) {
@@ -84,6 +87,7 @@ func NewPublisher(rabbitURL string) (*Publisher, error) {
 	return &Publisher{
 		rabbitConn: conn,
 		rabbitChan: ch,
+		rabbitURL:  rabbitURL,
 	}, nil
 }
 
@@ -115,4 +119,133 @@ func (p *Publisher) ConsumeResults() (<-chan amqp.Delivery, error) {
 		nil,                // args
 	)
 	return msgs, nil
+}
+
+func (p *Publisher) IsConnected() bool {
+	if p.rabbitConn == nil || p.rabbitConn.IsClosed() {
+		return false
+	}
+	return true
+}
+
+func (p *Publisher) Reconnect(ctx context.Context) error {
+	log.Println("Starting reconnect")
+	ticker := time.NewTicker(reconnectDelay)
+	defer ticker.Stop()
+
+	for {
+		if p.IsConnected() {
+			log.Println("Connection is already active during reconnect attempt.")
+			return nil
+		}
+
+		p.Close()
+		err := p.connect()
+		if err == nil {
+			log.Println("Reconnect successful.")
+			return nil
+		}
+
+		log.Printf("Reconnect attempt failed: %v. Retrying after %v", err, reconnectDelay)
+
+		select {
+		case <-ctx.Done():
+			log.Printf("Reconnect context cancelled: %v", ctx.Err())
+			return fmt.Errorf("reconnect aborted by context: %w", ctx.Err())
+		case <-ticker.C:
+			// Продолжаем следующую итерацию цикла for.
+		}
+	}
+}
+
+func (p *Publisher) connect() error {
+	var err error
+	conn, err := amqp.Dial(p.rabbitURL)
+	if err != nil {
+		return fmt.Errorf("failed to dial RabbitMQ: %w", err)
+	}
+	p.rabbitConn = conn
+
+	ch, err := p.rabbitConn.Channel()
+	if err != nil {
+		p.rabbitConn.Close()
+		p.rabbitConn = nil
+		return fmt.Errorf("failed to open a channel: %w", err)
+	}
+	p.rabbitChan = ch
+
+	if err := p.declareSchema(); err != nil {
+		p.rabbitChan.Close()
+		p.rabbitConn.Close()
+		p.rabbitChan = nil
+		p.rabbitConn = nil
+		return fmt.Errorf("failed to declare RabbitMQ schema: %w", err)
+	}
+
+	if err := p.rabbitChan.Qos(1, 0, false); err != nil {
+		p.rabbitChan.Close()
+		p.rabbitConn.Close()
+		p.rabbitChan = nil
+		p.rabbitConn = nil
+		return fmt.Errorf("failed to set QoS: %w", err)
+	}
+
+	return nil
+}
+
+func (p *Publisher) declareSchema() error {
+	err := p.rabbitChan.ExchangeDeclare(
+		taskExchangeName, // name
+		"direct",         // type
+		true,             // durable
+		false,            // auto-deleted
+		false,            // internal
+		false,            // no-wait
+		nil,              // arguments
+	)
+	if err != nil {
+		return err
+	}
+
+	p.rabbitChan.QueueDeclare(
+		taskQueueName, // name
+		true,          // durable
+		false,         // delete when unused
+		false,         // exclusive
+		false,         // no-wait
+		nil,           // arguments
+	)
+	p.rabbitChan.QueueBind(
+		taskQueueName,    // queue name
+		taskRoutingKey,   // routing key
+		taskExchangeName, // exchange
+		false,
+		nil,
+	)
+
+	p.rabbitChan.QueueDeclare(
+		resultQueueName, // name
+		true,            // durable
+		false,           // delete when unused
+		false,           // exclusive
+		false,           // no-wait
+		nil,             // arguments
+	)
+	p.rabbitChan.QueueBind(
+		resultQueueName,  // queue name
+		resultRoutingKey, // routing key for results
+		taskExchangeName, // exchange
+		false,
+		nil)
+
+	return nil
+}
+
+func (p *Publisher) Close() {
+	if p.rabbitConn != nil && !p.rabbitConn.IsClosed() {
+		if err := p.rabbitConn.Close(); err != nil {
+			log.Printf("Warn: Error closing RabbitMQ connection: %v", err)
+		}
+		p.rabbitConn = nil
+	}
 }

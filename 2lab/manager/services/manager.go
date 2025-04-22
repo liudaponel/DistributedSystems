@@ -11,6 +11,7 @@ import (
 	"manager/repository"
 	"time"
 
+	"github.com/streadway/amqp"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 )
@@ -19,6 +20,7 @@ const (
 	requestTimeout           = 10 * time.Minute // Таймаут на выполнение всего запроса
 	numTaskParts             = 3                // На сколько частей делить задачу
 	pendingTaskRetryInterval = 10 * time.Second // Интервал переотправки зависших задач
+	reconnectDelay           = 5 * time.Second
 )
 
 type Manager struct {
@@ -42,7 +44,7 @@ func NewManager(mongoClient *mongo.Client, rabbitURL string) (*Manager, error) {
 	}
 
 	// Запускаем обработчик результатов параллельно
-	go m.listenForResults()
+	go m.listenForResults(ctx)
 	// Запускаем обработчик неотправленных задач
 	go m.runPendingTaskPublisher(ctx)
 
@@ -136,23 +138,80 @@ func (manager *Manager) setRequestTimeout(requestID string) {
 }
 
 // слушает очередь результатов от воркеров
-func (m *Manager) listenForResults() {
-	msgs, err := m.Publisher.ConsumeResults()
-	if err != nil {
-		return
-	}
-	forever := make(chan bool)
+func (m *Manager) listenForResults(ctx context.Context) {
+	log.Println("Starting workers listener")
 
-	go func() {
-		for msg := range msgs {
-			var res models.WorkerResponse
-			json.Unmarshal(msg.Body, &res)
-			m.processWorkerResult(res)
-			msg.Ack(false)
+	for {
+		// Проверяем главный контекст перед каждой попыткой подключения
+		select {
+		case <-ctx.Done():
+			log.Println("Main context cancelled before attempting connection cycle.")
+			return
+		default:
+			// Продолжаем попытку
 		}
-	}()
 
-	<-forever // Блокируемся здесь, чтобы основная горутина listenForResults не завершилась
+		if !m.Publisher.IsConnected() {
+			log.Println("Attempting reconnect before consuming results")
+			err := m.Publisher.Reconnect(ctx)
+			if err != nil {
+				log.Printf("Reconnect failed: %v. Stopping listener.", err)
+			}
+			log.Println("Reconnect successful.")
+		}
+
+		log.Println("Attempting to establish result consumer")
+		var msgs <-chan amqp.Delivery
+		var err error
+
+		msgs, err = m.Publisher.ConsumeResults()
+		if err != nil {
+			log.Printf("Failed to establish result consumer: %v. Will retry connection after delay", err)
+
+			select {
+			case <-time.After(reconnectDelay):
+				continue // Начать следующую итерацию внешнего цикла for
+			case <-ctx.Done():
+				log.Println("Main context cancelled while waiting to retry consumer setup.")
+			}
+		}
+
+		log.Println("Result consumer established successfully. Waiting for results...")
+	consumeLoop: // Метка для выхода из этого цикла
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("ain context cancelled while consuming results. Stopping listener.")
+				return
+			case d, ok := <-msgs:
+				if !ok {
+					log.Println("Result message channel closed. Breaking consume loop to attempt reconnect.")
+					break consumeLoop
+				}
+
+				log.Printf("Manager received a result message: %s", d.Body)
+				var res models.WorkerResponse
+				json.Unmarshal(d.Body, &res)
+
+				err = m.processWorkerResult(res)
+				if err != nil {
+					log.Printf("Manager failed to process worker result for request %s: %v", res.RequestId, err)
+					d.Nack(false, true)
+				} else {
+					d.Ack(false)
+				}
+			}
+		}
+
+		// Если мы здесь, значит break consumeLoop был вызван (канал msgs закрылся)
+
+		select {
+		case <-time.After(reconnectDelay):
+		case <-ctx.Done():
+			log.Println("Main context cancelled immediately after channel closure.")
+			return
+		}
+	}
 }
 
 // processWorkerResult обновляет состояние запроса в MongoDB на основе ответа воркера

@@ -8,6 +8,7 @@ import (
 	"log"
 	"math"
 	"strings"
+	"time"
 
 	"worker/models"
 	"worker/publisher"
@@ -16,7 +17,8 @@ import (
 )
 
 const (
-	defaultCharset = "abcdefghijklmnopqrstuvwxyz0123456789"
+	defaultCharset    = "abcdefghijklmnopqrstuvwxyz0123456789"
+	publishRetryDelay = 5 * time.Second
 )
 
 type Worker struct {
@@ -40,45 +42,125 @@ func NewWorker(rabbitURL string) (*Worker, error) {
 }
 
 func (w *Worker) StartConsuming(ctx context.Context) error {
-	msgs, err := w.Publisher.ConsumeResults()
-	if err != nil {
-		return err
-	}
-	log.Println("Consumer started. Waiting for messages or context cancellation...")
 
 	for {
+		// Проверяем главный контекст перед каждой попыткой подключения/потребления
 		select {
 		case <-ctx.Done():
-			log.Println("Worker stopping")
+			log.Println("Main context cancelled before attempting connection cycle.")
 			return ctx.Err()
-		case msg := <-msgs:
-			w.processNewTask(msg)
+		default:
+			// Продолжаем попытку
 		}
+
+		if !w.Publisher.IsConnected() {
+			log.Println("Not connected. Attempting reconnect before consuming")
+			// содержит цикл с переподключением
+			err := w.Publisher.Reconnect(ctx)
+			if err != nil {
+				log.Printf("Reconnect failed: %v. Worker stopping.", err)
+				return err
+			}
+			log.Println("Reconnect successful.")
+		}
+
+		log.Println("Attempting to establish consumer...")
+		msgs, err := w.Publisher.ConsumeResults()
+		if err != nil {
+			log.Printf("Failed to establish consumer: %v. Will retry connection after delay...", err)
+			// Ждем перед следующей попыткой во внешнем цикле
+			select {
+			case <-time.After(publishRetryDelay):
+				continue // Начать следующую итерацию внешнего цикла for
+			case <-ctx.Done():
+				log.Println("Main context cancelled while waiting to retry consumer setup.")
+				return ctx.Err()
+			}
+		}
+
+		// внутренний цикл потребления сообщений
+		log.Println("Consumer established successfully. Waiting for messages...")
+	consumeLoop:
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("Main context cancelled while consuming. Worker stopping.")
+				// Сообщение (если было взято) не Ack'ается, вернется в очередь
+				return ctx.Err()
+			case msg, ok := <-msgs:
+				if !ok {
+					log.Println("RabbitMQ message channel closed. Breaking consume loop to attempt reconnect.")
+					break consumeLoop // Выходим из внутреннего цикла for, чтобы внешний цикл попробовал переподключиться
+				}
+				w.processNewTask(ctx, msg)
+			}
+		}
+
+		// Если мы здесь, значит break consumeLoop был вызван (канал msgs закрылся)
+		select {
+		case <-time.After(1 * time.Second):
+		case <-ctx.Done():
+			log.Println("Main context cancelled immediately after channel closure.")
+			return ctx.Err()
+		}
+
 	}
 }
 
-func (w *Worker) processNewTask(msg amqp.Delivery) {
-	var task models.TaskRequest
-	json.Unmarshal(msg.Body, &task)
-	log.Printf("Processing task for RequestId: %s, Part: %d/%d", task.RequestId, task.PartNumber, task.PartCount)
-
-	foundWords := w.BruteForce(task)
-
-	response := models.TaskResponse{
-		RequestId:  task.RequestId,
-		Words:      foundWords,
-		PartNumber: task.PartNumber,
-	}
-	body, _ := json.Marshal(response)
-
-	err := w.Publisher.PublishResponse(body)
-	if err != nil {
-		log.Printf("Failed to publish result for task %s part %d: %v", task.RequestId, task.PartNumber, err)
+func (w *Worker) processNewTask(ctx context.Context, msg amqp.Delivery) {
+	if len(msg.Body) == 0 {
+		_ = msg.Nack(false, false)
 		return
 	}
-	log.Printf("Sent result for RequestId: %s, Part: %d, words: %v", task.RequestId, task.PartNumber, response.Words)
+	var task models.TaskRequest
+	err := json.Unmarshal(msg.Body, &task)
+	if err != nil {
+		log.Printf("Failed to unmarshal message body: %v. Body: %s", err, string(msg.Body))
+		_ = msg.Nack(false, false)
+		return
+	}
+	if task.PartCount <= 0 {
+		log.Printf("Received task with invalid PartCount <= 0. RequestId: %s, Part: %d/%d", task.RequestId, task.PartNumber, task.PartCount)
+		_ = msg.Nack(false, false)
+		return
+	}
 
-	msg.Ack(false)
+	log.Printf("Processing task for RequestId: %s, Part: %d/%d", task.RequestId, task.PartNumber, task.PartCount)
+	foundWords := w.BruteForce(task)
+	response := models.TaskResponse{RequestId: task.RequestId, Words: foundWords, PartNumber: task.PartNumber}
+	body, _ := json.Marshal(response)
+
+	log.Printf("Attempting to publish result for RequestId: %s, Part: %d...", task.RequestId, task.PartNumber)
+	for { // Бесконечный цикл попыток отправки
+		select {
+		case <-ctx.Done():
+			log.Printf("Context cancelled during publish attempt for task %s part %d. Aborting publish and exiting without Ack.", task.RequestId, task.PartNumber)
+			return
+		default:
+			// Продолжаем попытку отправки
+		}
+
+		err = w.Publisher.PublishResponse(body)
+		if err == nil {
+			log.Printf("Successfully published result for RequestId: %s, Part: %d, words: %v", task.RequestId, task.PartNumber, response.Words)
+			msg.Ack(false)
+			return
+		}
+
+		log.Printf("Failed to publish result for task %s part %d: %v. Will retry after reconnect attempt.", task.RequestId, task.PartNumber, err)
+
+		// Пытаемся переподключиться.
+		log.Println("Attempting reconnect...")
+		reconnectErr := w.Publisher.Reconnect(ctx)
+		if reconnectErr != nil {
+			log.Printf("Reconnect failed for task %s part %d because context was cancelled: %v. Exiting without Ack.", task.RequestId, task.PartNumber, reconnectErr)
+			return
+		}
+		log.Println("Reconnect successful. Retrying publish")
+		// Цикл for продолжится и снова попытается вызвать PublishResponse
+		time.Sleep(1 * time.Second)
+
+	}
 }
 
 func (w *Worker) BruteForce(task models.TaskRequest) []string {
