@@ -80,7 +80,7 @@ func (r *Repository) SavePendingTask(req models.WorkerRequest, body []byte) erro
 	return err
 }
 
-func (r *Repository) AllRequestsCursor() (context.Context, context.CancelFunc, *mongo.Cursor) {
+func (r *Repository) AllPendingTasksCursor() (context.Context, context.CancelFunc, *mongo.Cursor) {
 	findCtx, findCancel := context.WithTimeout(context.Background(), dbOperationTimeout)
 	cursor, _ := r.pendingTaskCollection.Find(findCtx, bson.M{})
 

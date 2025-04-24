@@ -106,20 +106,21 @@ func (manager *Manager) runPendingTaskPublisher(ctx context.Context) {
 	}
 }
 
-func (manager *Manager) tryRepublishPendingTasks() {
-	findCtx, findCancel, cursor := manager.Repository.AllRequestsCursor()
+func (m *Manager) tryRepublishPendingTasks() {
+	findCtx, findCancel, cursor := m.Repository.AllPendingTasksCursor()
 	defer findCancel()
 	defer cursor.Close(findCtx)
 
 	for cursor.Next(findCtx) {
 		var task models.PendingTask
+		cursor.Decode(&task)
+		publishErr := m.Publisher.PublishTask(task.TaskBody)
 
-		err := manager.Publisher.PublishTask(task.TaskBody)
-		if err == nil {
+		if publishErr == nil {
 			log.Printf("Successfully republished pending task for request %s", task.RequestID)
-			manager.Repository.DeletePendingTask(task.ID)
+			m.Repository.DeletePendingTask(task.ID)
 		} else {
-			log.Printf("Failed to republish pending task %s. I will retry later.", task.RequestID)
+			log.Printf("Failed to republish pending task for request %s: %v. Will retry later.", task.RequestID, publishErr)
 		}
 	}
 }
